@@ -1,0 +1,52 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Logs / temp
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+dist/
+build/
+*.egg-info/
+
+# Node
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+coverage/
+*.tsbuildinfo
+
+# Project artifacts
+
+artifacts/
+archive/zips/

@@ -1,0 +1,21 @@
+<form id="transcriptionForm">
+    <select id="videoType">
+        <option value="text">Text</option>
+        <option value="recorded">Recorded Video</option>
+        <option value="live">Live Stream</option>
+    </select>
+    <div id="textContainer" class="hidden">
+        <textarea id="textInput" placeholder="Enter text to analyze"></textarea>
+    </div>
+    <div id="urlContainer">
+        <input type="text" id="videoUrl" placeholder="Enter video URL">
+    </div>
+    <select id="language">
+        <option value="en">English</option>
+        <option value="es">Spanish</option>
+        <!-- Add more languages as needed -->
+    </select>
+    <button id="startTranscription">Start Analysis</button>
+    <button id="stopTranscription" class="hidden">Stop Stream</button>
+    <div id="loadingMessage" class="hidden">Loading...</div>
+</form>

@@ -1,0 +1,11 @@
+Flask==2.3.3
+python-dotenv==1.0.0
+flask-cors==4.0.0
+flask-socketio==5.3.6
+assemblyai==0.12.0
+feedparser==6.0.10
+requests==2.31.0
+python-string-similarity==2.0.0
+yt-dlp==2023.11.16
+winston-python==1.0.1
+werkzeug==2.3.7
