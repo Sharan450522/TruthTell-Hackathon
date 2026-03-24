@@ -16,6 +16,7 @@ Clean Python-first repository layout for backend services, notebooks, and data w
 ## Run
 
 Use `docs/runbook.md` for setup and start commands.
+Use `docs/model_workflow_and_methods.md` for datasets, fine-tuning workflow, and methods summary.
 
 Quick launch from project root (PowerShell):
 
