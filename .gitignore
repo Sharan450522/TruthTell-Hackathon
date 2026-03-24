@@ -47,6 +47,9 @@ coverage/
 *.tsbuildinfo
 
 # Project artifacts
-
+data/raw/
+data/processed/
 artifacts/
 archive/zips/
+data/raw/*.csv
+data/processed/*.csv
