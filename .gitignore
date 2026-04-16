@@ -22,6 +22,10 @@ logs/
 tmp/
 temp/
 *.tmp
+*.part
+*.ytdl
+*.frag
+*.frag.urls
 
 # Python
 __pycache__/
@@ -47,12 +51,26 @@ coverage/
 *.tsbuildinfo
 
 # Project artifacts
+data/
+!data/.gitkeep
 data/raw/
 data/processed/
 artifacts/
 archive/zips/
 data/raw/*.csv
 data/processed/*.csv
+src/backend/python_app/saved_models/
+src/backend/python_app/app.log
+src/backend/python_app/start_error.txt
+src/backend/python_app/temp_*.*
+src/backend/node_api/*.log
+src/backend/node_api/--Frag*
+
+# Local model/download caches
+.cache/
+hf_cache/
+huggingface/
+models--*/
 
 # Large ML/data/media artifacts
 *.zip
