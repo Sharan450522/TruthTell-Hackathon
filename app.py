@@ -28,8 +28,9 @@ from text_aggregator import aggregate_text, prepare_content_pieces
 # Import VideoProcessor from video_processing.py (modified below)
 from video_processing import VideoProcessor
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file.
+# Override is intentional so edits in .env replace stale shell/session values.
+load_dotenv(override=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -117,13 +118,13 @@ def needs_evidence_verification(analysis, source_type):
 def analyze_content(pieces, source_type, url=None, file_name=None):
     prepared_pieces = prepare_content_pieces(pieces)
     merged_text = aggregate_text(prepared_pieces, source_type=source_type)
-    analysis = fake_news_predictor.predict(merged_text, source_type=source_type)
-    analysis['needs_verification'] = needs_evidence_verification(analysis, source_type)
 
     try:
         source_id = feedback_store.create_source(source_type, url=url, file_name=file_name)
-        prediction_id = feedback_store.save_prediction(source_id, analysis, merged_text)
         feedback_store.save_extracted_content(source_id, prepared_pieces)
+        analysis = fake_news_predictor.predict(merged_text, source_type=source_type)
+        analysis['needs_verification'] = needs_evidence_verification(analysis, source_type)
+        prediction_id = feedback_store.save_prediction(source_id, analysis, merged_text)
         vector_result = pinecone_store.upsert_content(
             source_id,
             source_type,
@@ -533,6 +534,88 @@ def emit_live_video_preview(video_url, temp_fragment, sid, segment_duration):
         if os.path.exists(temp_fragment):
             os.remove(temp_fragment)
 
+
+def recorded_video_download_commands(video_url, temp_path):
+    recorded_format = os.getenv('YT_DLP_RECORDED_FORMAT', 'bv*+ba/best')
+    base_cmd = [
+        YT_DLP_PATH,
+        '--no-playlist',
+        '--force-overwrites',
+        '--retries', '10',
+        '--fragment-retries', '10',
+        '-f', recorded_format,
+        '--merge-output-format', 'mp4',
+        '--recode-video', 'mp4',
+    ]
+
+    js_runtime = os.getenv('YT_DLP_JS_RUNTIME', '').strip()
+    if js_runtime:
+        base_cmd.extend(['--js-runtimes', js_runtime])
+
+    commands = []
+    cookies_file = os.getenv('YT_DLP_COOKIES_FILE', '').strip()
+    if cookies_file:
+        commands.append(base_cmd + ['--cookies', cookies_file, '-o', temp_path, video_url])
+
+    commands.append(base_cmd + ['-o', temp_path, video_url])
+
+    cookies_from_browser = os.getenv('YT_DLP_COOKIES_FROM_BROWSER', '').strip()
+    recorded_cookie_setting = os.getenv('YT_DLP_USE_BROWSER_COOKIES_FOR_RECORDED', '').strip().lower()
+    use_browser_cookies = recorded_cookie_setting in {'1', 'true', 'yes'} or (
+        bool(cookies_from_browser) and recorded_cookie_setting not in {'0', 'false', 'no'}
+    )
+    if cookies_from_browser and use_browser_cookies:
+        commands.append(base_cmd + ['--cookies-from-browser', cookies_from_browser, '-o', temp_path, video_url])
+
+    return commands
+
+
+def ytdlp_config_status():
+    cookies_file = os.getenv('YT_DLP_COOKIES_FILE', '').strip()
+    cookies_file_exists = bool(cookies_file and os.path.exists(cookies_file))
+    cookies_file_size = os.path.getsize(cookies_file) if cookies_file_exists else 0
+    return {
+        "js_runtime": os.getenv('YT_DLP_JS_RUNTIME', '').strip(),
+        "recorded_format": os.getenv('YT_DLP_RECORDED_FORMAT', '').strip(),
+        "cookies_file_configured": bool(cookies_file),
+        "cookies_file_exists": cookies_file_exists,
+        "cookies_file_size": cookies_file_size,
+        "cookies_from_browser_configured": bool(os.getenv('YT_DLP_COOKIES_FROM_BROWSER', '').strip()),
+        "use_browser_cookies_for_recorded": os.getenv('YT_DLP_USE_BROWSER_COOKIES_FOR_RECORDED', '').strip(),
+        "use_browser_cookies_for_live": os.getenv('YT_DLP_USE_BROWSER_COOKIES_FOR_LIVE', '').strip(),
+    }
+
+
+def download_recorded_video(video_url, temp_path):
+    captured_errors = []
+    logger.info("yt-dlp recorded config: %s", ytdlp_config_status())
+    for index, cmd in enumerate(recorded_video_download_commands(video_url, temp_path), start=1):
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        logger.info(f"Downloading recorded video from URL using yt-dlp variant {index}: {video_url}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode == 0 and os.path.exists(temp_path):
+            return temp_path
+        captured_errors.append((result.stderr or result.stdout or '')[-1600:])
+
+    raise RuntimeError("Video download failed after fallbacks. " + " | ".join(captured_errors))
+
+
+def summarize_download_error(error_text):
+    lowered = str(error_text).lower()
+    if "sign in to confirm" in lowered or "not a bot" in lowered:
+        return (
+            "YouTube requires authenticated cookies for this URL. Export cookies to cookies.txt "
+            "or enable browser cookies for recorded downloads."
+        )
+    if "no supported javascript runtime" in lowered:
+        return "yt-dlp needs a JavaScript runtime. Install Deno and set YT_DLP_JS_RUNTIME=deno."
+    if "could not copy chrome cookie database" in lowered:
+        return "Chrome cookie database is locked. Close Chrome or use an exported cookies.txt file."
+    if "requested format is not available" in lowered:
+        return "Requested YouTube format is unavailable. Try YT_DLP_RECORDED_FORMAT=best."
+    return "Recorded video download failed. Check yt-dlp cookies/runtime/format settings."
+
 def start_live_stream(sid, video_url, stop_event):
     max_retries = 3
     segment_duration = 30  # seconds
@@ -682,14 +765,14 @@ def analyze_recorded_video_route():
             file_name = "downloaded_video.mp4"
             os.makedirs('temp', exist_ok=True)
             try:
-                # Force conversion to MP4
-                cmd = [YT_DLP_PATH, "-o", temp_path, "--recode-video", "mp4", video_path]
-                logger.info(f"Downloading video from URL: {video_path}")
-                subprocess.run(cmd, check=True)
-                video_path = temp_path
+                video_path = download_recorded_video(video_path, temp_path)
             except Exception as e:
                 logger.error(f"Video download failed: {e}")
-                return jsonify({"error": f"Video download failed: {e}"}), 400
+                return jsonify({
+                    "error": summarize_download_error(str(e)),
+                    "details": str(e)[-4000:],
+                    "success": False,
+                }), 400
 
         elif not video_path or not os.path.exists(video_path):
             logger.error("A valid file_path is required for recorded video analysis.")
@@ -720,6 +803,36 @@ def analyze_recorded_video_route():
     except Exception as e:
         logger.error(f"Recorded video analysis error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/test-recorded-download', methods=['POST'])
+def test_recorded_download_route():
+    data = request.get_json() or {}
+    video_url = data.get('url') or data.get('file_path')
+    if not video_url:
+        return jsonify({"error": "url is required"}), 400
+    if not video_url.startswith("http"):
+        return jsonify({"error": "url must be an http(s) video URL"}), 400
+
+    os.makedirs('temp', exist_ok=True)
+    temp_path = os.path.join('temp', "download_test_video.mp4")
+    try:
+        download_recorded_video(video_url, temp_path)
+        file_size = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+        return jsonify({
+            "success": True,
+            "file_size": file_size,
+            "message": "Recorded video download succeeded.",
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": summarize_download_error(str(e)),
+            "details": str(e)[-4000:],
+        }), 400
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 # ---------------------------------------------------------------------------
 # Other Endpoints and Socket.IO Events
@@ -838,6 +951,11 @@ def review_label_route():
 @app.route('/api/vector-status', methods=['GET'])
 def vector_status_route():
     return jsonify(pinecone_store.status())
+
+
+@app.route('/api/ytdlp-status', methods=['GET'])
+def ytdlp_status_route():
+    return jsonify(ytdlp_config_status())
 
 @app.route('/api/trending-news', methods=['GET'])
 def trending_news_route():
