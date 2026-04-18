@@ -230,7 +230,7 @@ The UI mainly uses `/api/analyze-media`.
 ```text
 Live stream URL
 -> Socket.IO start_live event
--> loop every 30 seconds
+-> loop every 20 seconds by default
 -> capture short live audio segment with yt-dlp
 -> preferred format: ba/bestaudio/best
 -> fallback: resolve audio stream URL with yt-dlp
@@ -268,8 +268,11 @@ Example live response:
     "confidence": 0.62,
     "status": "likely_fake",
     "needs_verification": true,
+    "chunk_index": 0,
+    "chunk_start_sec": 0,
     "cumulative_confidence": 0.59
   },
+  "chunk_duration_sec": 20,
   "type": "Segment"
 }
 ```
@@ -437,4 +440,3 @@ Expected working storage response after at least one analysis:
   "namespace": "__default__"
 }
 ```
-

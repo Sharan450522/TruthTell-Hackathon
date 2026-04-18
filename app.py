@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import sys
 import time
 import json
 import difflib
@@ -54,18 +55,40 @@ pinecone_store = PineconeTextStore()
 aai.settings.api_key = os.getenv('ASSEMBLYAI_API_KEY')
 if not aai.settings.api_key:
     raise ValueError("ASSEMBLYAI_API_KEY is not set in environment variables")
+ASSEMBLYAI_SPEECH_MODEL = os.getenv("ASSEMBLYAI_SPEECH_MODEL", "universal-2")
 # Instantiate transcriber using updated configuration
-transcriber = aai.Transcriber(config=aai.TranscriptionConfig(language_code="en"))
+transcriber = aai.Transcriber(config=aai.TranscriptionConfig(
+    language_code="en",
+    speech_models=[ASSEMBLYAI_SPEECH_MODEL],
+))
 
-# Paths to executables
-YT_DLP_PATH = shutil.which("yt-dlp") or os.path.join(os.getcwd(), "yt-dlp.exe")
-FFMPEG_PATH = shutil.which("ffmpeg") or os.path.join(os.getcwd(), "ffmpeg.exe")
+def resolve_executable(env_name, executable_name):
+    configured_path = os.getenv(env_name, '').strip()
+    if configured_path:
+        return configured_path
+
+    venv_scripts_path = os.path.join(os.path.dirname(sys.executable), executable_name)
+    if os.path.exists(venv_scripts_path):
+        return venv_scripts_path
+
+    local_path = os.path.join(os.getcwd(), executable_name)
+    if os.path.exists(local_path):
+        return local_path
+
+    return shutil.which(executable_name) or local_path
+
+
+# Paths to executables. Prefer the active virtualenv over a stale global PATH.
+YT_DLP_PATH = resolve_executable("YT_DLP_PATH", "yt-dlp.exe" if os.name == "nt" else "yt-dlp")
+FFMPEG_PATH = resolve_executable("FFMPEG_PATH", "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 
 # Verify executables exist
 if not os.path.exists(YT_DLP_PATH):
     raise FileNotFoundError(f"yt-dlp not found at {YT_DLP_PATH}. Please install it or update the path.")
 if not os.path.exists(FFMPEG_PATH):
     raise FileNotFoundError(f"ffmpeg not found at {FFMPEG_PATH}. Please install it or update the path.")
+logger.info(f"Using yt-dlp executable: {YT_DLP_PATH}")
+logger.info(f"Using ffmpeg executable: {FFMPEG_PATH}")
 
 # Simple Cache Manager for temporary in-memory storage
 class CacheManager:
@@ -115,8 +138,12 @@ def needs_evidence_verification(analysis, source_type):
     )
 
 
-def analyze_content(pieces, source_type, url=None, file_name=None):
+def analyze_content(pieces, source_type, url=None, file_name=None, timestamp_sec=None):
     prepared_pieces = prepare_content_pieces(pieces)
+    if timestamp_sec is not None:
+        for piece in prepared_pieces:
+            if piece.get('timestamp_sec') is None:
+                piece['timestamp_sec'] = timestamp_sec
     merged_text = aggregate_text(prepared_pieces, source_type=source_type)
 
     try:
@@ -159,6 +186,26 @@ def analyze_content(pieces, source_type, url=None, file_name=None):
 def analyze_text(text, source_type='text', url=None, file_name=None):
     pieces = [{'type': 'text', 'text': text}]
     analysis, _ = analyze_content(pieces, source_type, url=url, file_name=file_name)
+    return analysis
+
+
+def analyze_live_chunk(text, video_url, current_time, chunk_index):
+    pieces = [{
+        'type': 'transcript',
+        'text': text,
+        'timestamp_sec': current_time,
+    }]
+    analysis, classification_text = analyze_content(
+        pieces,
+        source_type='live_stream',
+        url=video_url,
+        timestamp_sec=current_time,
+    )
+    analysis.update({
+        'chunk_index': chunk_index,
+        'chunk_start_sec': current_time,
+        'classification_text': classification_text,
+    })
     return analysis
 
 
@@ -392,6 +439,33 @@ def build_ytdlp_command(format_selector, output_path, video_url, extra_args=None
     return cmd
 
 
+def terminate_process(process):
+    try:
+        process.terminate()
+        process.communicate(timeout=8)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.communicate(timeout=8)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def safe_remove(path):
+    if not path or not os.path.exists(path):
+        return
+    for _ in range(5):
+        try:
+            os.remove(path)
+            return
+        except PermissionError:
+            time.sleep(0.5)
+        except OSError:
+            return
+
+
 def capture_live_audio_segment(video_url, temp_audio, segment_duration):
     audio_format = os.getenv('YT_DLP_LIVE_AUDIO_FORMAT', 'ba/bestaudio/best')
     captured_error_logs = []
@@ -403,19 +477,19 @@ def capture_live_audio_segment(video_url, temp_audio, segment_duration):
     ]
 
     for idx, cmd in enumerate(cmd_variants, start=1):
-        if os.path.exists(temp_audio):
-            os.remove(temp_audio)
+        safe_remove(temp_audio)
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
         timed_out = False
         try:
             _, error = process.communicate(timeout=segment_duration + 20)
         except subprocess.TimeoutExpired:
-            process.terminate()
-            _, error = process.communicate(timeout=15)
+            terminate_process(process)
+            error = b"yt-dlp live audio capture timed out"
             timed_out = True
             logger.info(f"Stopped yt-dlp audio capture after live window (variant {idx})")
 
@@ -509,16 +583,29 @@ def capture_live_audio_with_stream_url(video_url, temp_audio, segment_duration):
         return str(e)
 
 
+def cleanup_live_temp_files(chunk_token):
+    for prefix, extension in (
+        ("live_audio", "mp3"),
+        ("live_segment", "mp4"),
+    ):
+        path = os.path.join('temp', f"{prefix}_{chunk_token}.{extension}")
+        safe_remove(path)
+
+
 def emit_live_video_preview(video_url, temp_fragment, sid, segment_duration):
     try:
         video_format = os.getenv('YT_DLP_LIVE_VIDEO_FORMAT', 'bv*[height<=480]/best[height<=480]/best')
         cmd = build_ytdlp_command(video_format, temp_fragment, video_url)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
         try:
             _, _ = process.communicate(timeout=min(segment_duration, 12))
         except subprocess.TimeoutExpired:
-            process.terminate()
-            _, _ = process.communicate(timeout=10)
+            terminate_process(process)
 
         if not os.path.exists(temp_fragment) or os.path.getsize(temp_fragment) < 10_000:
             return
@@ -531,8 +618,7 @@ def emit_live_video_preview(video_url, temp_fragment, sid, segment_duration):
     except Exception as e:
         logger.info(f"Live video preview skipped: {e}")
     finally:
-        if os.path.exists(temp_fragment):
-            os.remove(temp_fragment)
+        safe_remove(temp_fragment)
 
 
 def recorded_video_download_commands(video_url, temp_path):
@@ -590,8 +676,7 @@ def download_recorded_video(video_url, temp_path):
     captured_errors = []
     logger.info("yt-dlp recorded config: %s", ytdlp_config_status())
     for index, cmd in enumerate(recorded_video_download_commands(video_url, temp_path), start=1):
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        safe_remove(temp_path)
         logger.info(f"Downloading recorded video from URL using yt-dlp variant {index}: {video_url}")
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode == 0 and os.path.exists(temp_path):
@@ -618,23 +703,25 @@ def summarize_download_error(error_text):
 
 def start_live_stream(sid, video_url, stop_event):
     max_retries = 3
-    segment_duration = 30  # seconds
+    segment_duration = int(os.getenv('LIVE_CHUNK_DURATION_SECONDS', '20'))
+    current_time = 0
+    chunk_index = 0
     # Initialize variables for cumulative confidence analysis
     prev_conf = None
     alpha = 0.5  # Smoothing factor (adjust as needed)
 
     while not stop_event.is_set():
         for attempt in range(max_retries):
+            chunk_token = f"{sid}_{chunk_index}_{int(time.time() * 1000)}"
             try:
                 # Download a short live segment using yt-dlp directly.
                 # This avoids handing ffmpeg an expiring manifest URL that can trigger 403 errors.
                 os.makedirs('temp', exist_ok=True)
-                temp_fragment = os.path.join('temp', f"live_segment_{sid}.mp4")
-                temp_audio = os.path.join('temp', f"live_audio_{sid}.mp3")
+                temp_fragment = os.path.join('temp', f"live_segment_{chunk_token}.mp4")
+                temp_audio = os.path.join('temp', f"live_audio_{chunk_token}.mp3")
 
                 video_data = capture_live_audio_segment(video_url, temp_audio, segment_duration)
-                if os.path.exists(temp_audio):
-                    os.remove(temp_audio)
+                safe_remove(temp_audio)
 
                 # Frame extraction is helpful for the UI, but transcription should
                 # not fail just because YouTube exposes no usable video-only format.
@@ -658,11 +745,12 @@ def start_live_stream(sid, video_url, stop_event):
                     continue
 
                 cache_manager.delete('audio', cache_key)
-                # Analyze the current segment's transcript
-                analysis = analyze_text(
+                # Store the current chunk text and classify it.
+                analysis = analyze_live_chunk(
                     transcript.text,
-                    source_type='live_stream',
-                    url=video_url,
+                    video_url,
+                    current_time,
+                    chunk_index,
                 )
                 curr_conf = analysis.get('confidence', 0.0)
 
@@ -681,11 +769,17 @@ def start_live_stream(sid, video_url, stop_event):
                         'cumulative_confidence': new_conf
                     },
                     'timestamp': datetime.now().isoformat(),
+                    'chunk_index': chunk_index,
+                    'chunk_start_sec': current_time,
+                    'chunk_duration_sec': segment_duration,
                     'type': 'Segment'
                 }, room=sid)
+                current_time += segment_duration
+                chunk_index += 1
                 break  # Exit the retry loop on success
 
             except Exception as e:
+                cleanup_live_temp_files(chunk_token)
                 logger.error(f"Error in live stream processing (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
                     time.sleep(5)

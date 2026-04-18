@@ -100,6 +100,7 @@ YT_DLP_EXTRACTOR_ARGS=
 YT_DLP_LIVE_AUDIO_FORMAT=ba/bestaudio/best
 YT_DLP_LIVE_VIDEO_FORMAT=bv*[height<=480]/best[height<=480]/best
 YT_DLP_JS_RUNTIME=
+LIVE_CHUNK_DURATION_SECONDS=20
 
 HF_TOKEN=
 ```
@@ -206,4 +207,3 @@ GNews/RSS
 ```
 
 Only direct user-analyzed content is stored.
-
